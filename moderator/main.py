@@ -1,15 +1,19 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.background import BackgroundTask
 import httpx
 import os
 import sqlite3
 from datetime import datetime, timezone
+import re
+import time
 
 app = FastAPI()
 
 # Your real API key passed in via docker-compose.yml
 REAL_API_KEY = os.getenv("API_KEY")
 GEMINI_BASE_URL = os.getenv("API_ENDPOINT")
+AGENT_TOKEN = os.getenv("AGENT_TOKEN")
 
 # Define your cognitive budget
 LIMITS = {
@@ -17,9 +21,28 @@ LIMITS = {
     "flash": 500
 }
 
+def validate_config():
+    """Fail fast if required runtime configuration is missing."""
+    missing = []
+    if not REAL_API_KEY:
+        missing.append("API_KEY")
+    if not GEMINI_BASE_URL:
+        missing.append("API_ENDPOINT")
+    if not AGENT_TOKEN:
+        missing.append("AGENT_TOKEN")
+    if missing:
+        names = ", ".join(missing)
+        raise RuntimeError(f"Missing required environment variable(s): {names}")
+
+def open_db():
+    conn = sqlite3.connect("usage.db", timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
 def init_db():
     """Initializes the SQLite database to track daily usage."""
-    conn = sqlite3.connect("usage.db")
+    conn = open_db()
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS api_usage (
@@ -32,53 +55,118 @@ def init_db():
     conn.commit()
     conn.close()
 
-def check_and_increment_limit(model_tier: str) -> bool:
-    """Checks if the agent has budget left, and increments the counter if so."""
+def with_retries(fn, retries: int = 3, delay_sec: float = 0.05):
+    """Retries sqlite operations that can fail under contention."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == retries - 1:
+                raise
+            time.sleep(delay_sec * (attempt + 1))
+
+def reserve_budget(model_tier: str) -> bool:
+    """Atomically reserves one call for this tier if budget remains."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    conn = sqlite3.connect("usage.db")
-    c = conn.cursor()
-    
-    # Get current usage
-    c.execute("SELECT calls FROM api_usage WHERE date=? AND model_tier=?", (today, model_tier))
-    row = c.fetchone()
-    current_calls = row[0] if row else 0
-    
-    # Check against limit
-    max_calls = LIMITS.get(model_tier, 0)
-    if current_calls >= max_calls:
-        conn.close()
-        return False
-        
-    # Increment usage
-    if row:
-        c.execute("UPDATE api_usage SET calls = calls + 1 WHERE date=? AND model_tier=?", (today, model_tier))
+    max_calls = LIMITS[model_tier]
+
+    def _op():
+        conn = open_db()
+        try:
+            c = conn.cursor()
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(
+                "SELECT calls FROM api_usage WHERE date=? AND model_tier=?",
+                (today, model_tier)
+            )
+            row = c.fetchone()
+            current_calls = row[0] if row else 0
+            if current_calls >= max_calls:
+                conn.rollback()
+                return False
+
+            if row:
+                c.execute(
+                    "UPDATE api_usage SET calls = calls + 1 WHERE date=? AND model_tier=?",
+                    (today, model_tier)
+                )
+            else:
+                c.execute(
+                    "INSERT INTO api_usage (date, model_tier, calls) VALUES (?, ?, ?)",
+                    (today, model_tier, 1)
+                )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    return with_retries(_op)
+
+def refund_budget(model_tier: str) -> None:
+    """Refunds one reserved call if upstream request failed."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    def _op():
+        conn = open_db()
+        try:
+            c = conn.cursor()
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(
+                """
+                UPDATE api_usage
+                SET calls = CASE WHEN calls > 0 THEN calls - 1 ELSE 0 END
+                WHERE date=? AND model_tier=?
+                """,
+                (today, model_tier)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    with_retries(_op)
+
+def infer_model_tier(path: str, body: bytes) -> str | None:
+    """Infers billing tier from request model; unknown models are denied."""
+    path_lower = path.lower()
+    model_name = None
+
+    path_match = re.search(r"models/([^:/?]+)", path_lower)
+    if path_match:
+        model_name = path_match.group(1)
     else:
-        c.execute("INSERT INTO api_usage (date, model_tier, calls) VALUES (?, ?, ?)", (today, model_tier, 1))
-        
-    conn.commit()
-    conn.close()
-    return True
+        body_text = body.decode("utf-8", errors="ignore").lower()
+        body_match = re.search(r'"model"\s*:\s*"([^"]+)"', body_text)
+        if body_match:
+            model_name = body_match.group(1).split("/")[-1]
+
+    if not model_name:
+        return None
+    if "pro" in model_name:
+        return "pro"
+    if "flash" in model_name:
+        return "flash"
+    return None
 
 # Initialize the database when the server starts
+validate_config()
 init_db()
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_to_gemini(path: str, request: Request):
     """Intercepts all requests, checks limits, and proxies to Google."""
-    
+
+    if request.headers.get("x-goog-api-key") != AGENT_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized agent token.")
+
+    # Read the body once; reuse for tier inference and proxying.
+    body = await request.body()
+
     # 1. Determine the model tier from the requested path
     # Google's SDK hits paths like: /v1beta/models/gemini-1.5-pro:generateContent
-    path_lower = path.lower()
-    if "pro" in path_lower:
-        model_tier = "pro"
-    elif "flash" in path_lower:
-        model_tier = "flash"
-    else:
-        # Default fallback if it's an embeddings model or something else
-        model_tier = "flash" 
+    model_tier = infer_model_tier(path, body)
+    if model_tier not in LIMITS:
+        raise HTTPException(status_code=400, detail="Unknown or unsupported model tier.")
 
     # 2. Check the budget
-    if not check_and_increment_limit(model_tier):
+    if not reserve_budget(model_tier):
         # Return a custom error that the agent can read and understand
         return JSONResponse(
             status_code=429,
@@ -99,9 +187,6 @@ async def proxy_to_gemini(path: str, request: Request):
     headers.pop("host", None) 
     headers["x-goog-api-key"] = REAL_API_KEY
 
-    # Read the body from the agent's request
-    body = await request.body()
-
     # Proxy the request using httpx
     async with httpx.AsyncClient() as client:
         try:
@@ -113,12 +198,21 @@ async def proxy_to_gemini(path: str, request: Request):
                 params=request.query_params
             )
             proxy_resp = await client.send(proxy_req, stream=True)
+
+            # Refund reservation when upstream fails.
+            if not (200 <= proxy_resp.status_code < 400):
+                refund_budget(model_tier)
             
             # Stream the response back to the agent (handles both streaming and standard responses)
             return StreamingResponse(
                 proxy_resp.aiter_raw(),
                 status_code=proxy_resp.status_code,
-                headers=dict(proxy_resp.headers)
+                headers=dict(proxy_resp.headers),
+                background=BackgroundTask(proxy_resp.aclose)
             )
         except httpx.RequestError as exc:
+            refund_budget(model_tier)
             raise HTTPException(status_code=502, detail=f"Error connecting to Google API: {exc}")
+        except Exception:
+            refund_budget(model_tier)
+            raise

@@ -15,6 +15,7 @@ COPY --chown=agentuser:agentuser requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --user
 
 COPY --chown=agentuser:agentuser loop.py .
+COPY --chown=agentuser:agentuser supervisor.py .
 
 # The agent's loop will start here
 CMD ["python", "supervisor.py"]

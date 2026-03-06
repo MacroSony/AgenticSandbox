@@ -1,15 +1,14 @@
-version: '3.8'
-
 services:
   moderator:
     build: ./moderator
     container_name: ai_moderator
     environment:
       # The REAL API key stays here, safe in the moderator
-      - API_ENDPOINT=${API_ENDPOINT}
-      - API_KEY=${API_KEY} 
-    ports:
-      - "8000:8000"
+      API_ENDPOINT: ${API_ENDPOINT}
+      API_KEY: ${API_KEY}
+      AGENT_TOKEN: ${AGENT_TOKEN}
+    expose:
+      - "8000"
     networks:
       - sandbox_net
 
@@ -20,22 +19,26 @@ services:
       - moderator
     environment:
       # The agent is tricked into thinking the moderator is the Gemini API
-      - GEMINI_API_BASE_URL=http://moderator:8000
-      - GEMINI_API_KEY=dummy_key_not_needed
+      GEMINI_API_BASE_URL: http://moderator:8000
+      GEMINI_API_KEY: ${AGENT_TOKEN}
+      AGENT_ROOT: /app/agent
     volumes:
-      # Mounts the local workspace folder to the container's /app/workspace
-      - ./agent:/app/agent
+      # Mount only the agent workspace to prevent reading host repo secrets.
+      - ./agent:/app/agent:rw
     working_dir: /app/agent
-    
+
     # Security & Sandboxing
     user: "1000:1000" # Runs as a non-root user
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: 2.0
+    mem_limit: 4g
     cap_drop:
       - ALL # Strips high-level Linux privileges
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'      # Limits the agent to 2 CPU cores
-          memory: 4G       # Prevents OOM crashes on your host machine
     networks:
       - sandbox_net
 
