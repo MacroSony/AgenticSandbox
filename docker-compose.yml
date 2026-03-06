@@ -2,10 +2,11 @@ services:
   moderator:
     build: ./moderator
     container_name: ai_moderator
-    network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       # The REAL API key stays here, safe in the moderator
-      API_ENDPOINT: ${API_ENDPOINT}
+      API_ENDPOINT: ${UPSTREAM_API_ENDPOINT:-http://host.docker.internal:8317}
       API_KEY: ${API_KEY}
       AGENT_TOKEN: ${AGENT_TOKEN}
 
@@ -14,13 +15,13 @@ services:
     container_name: ai_agent
     depends_on:
       - moderator
-    network_mode: host
     environment:
-      # With host networking, both services communicate over loopback.
-      GEMINI_API_BASE_URL: http://127.0.0.1:8000
+      # Services communicate over Docker's internal network using service names
+      GEMINI_API_BASE_URL: http://moderator:8000
       GEMINI_API_KEY: ${AGENT_TOKEN}
       AGENT_ROOT: /app/agent
-      SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
+      # Force Git to use our isolated deploy key and ignore host key prompts
+      GIT_SSH_COMMAND: "ssh -i /app/secrets/deploy_key -o StrictHostKeyChecking=no"
       GIT_AUTHOR_NAME: ${GIT_USER_NAME:-agent}
       GIT_AUTHOR_EMAIL: ${GIT_USER_EMAIL:-agent@example.com}
       GIT_COMMITTER_NAME: ${GIT_USER_NAME:-agent}
@@ -28,7 +29,8 @@ services:
     volumes:
       # Mount only the agent workspace to prevent reading host repo secrets.
       - ./agent:/app/agent:rw
-      - ${SSH_AUTH_SOCK}:/run/host-services/ssh-auth.sock:ro
+      # Mount the dedicated deploy key securely
+      - ./agent_deploy_key:/app/secrets/deploy_key:ro
     working_dir: /app/agent
 
     # Security & Sandboxing

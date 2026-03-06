@@ -1,3 +1,5 @@
 .env
 agent/creaters_note.md
 __pycache__
+agent_deploy_key
+agent_deploy_key.pub
