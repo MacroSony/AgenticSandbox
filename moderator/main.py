@@ -238,6 +238,30 @@ log_event(
 async def startup_probe() -> None:
     await probe_upstream_connectivity()
 
+@app.get("/usage")
+async def get_usage(request: Request):
+    """Returns the current API usage for the day."""
+    incoming_key = request.headers.get("x-goog-api-key") or request.query_params.get("key")
+    if incoming_key != AGENT_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized agent token.")
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    usage = {"date": today, "pro": 0, "flash": 0, "limits": LIMITS}
+    
+    def _op():
+        conn = open_db()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT model_tier, calls FROM api_usage WHERE date=?", (today,))
+            for tier, calls in c.fetchall():
+                if tier in usage:
+                    usage[tier] = calls
+            return usage
+        finally:
+            conn.close()
+
+    return with_retries(_op)
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_to_gemini(path: str, request: Request):
     """Intercepts all requests, checks limits, and proxies to Google."""
