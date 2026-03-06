@@ -111,7 +111,8 @@ def should_stream_response(path: str) -> bool:
     return ":streamgeneratecontent" in path_lower
 
 def open_db():
-    conn = sqlite3.connect("usage.db", timeout=5.0)
+    os.makedirs("data", exist_ok=True)
+    conn = sqlite3.connect("data/usage.db", timeout=5.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
