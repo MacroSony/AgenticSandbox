@@ -18,8 +18,8 @@ AGENT_TOKEN = os.getenv("AGENT_TOKEN")
 
 # Define your cognitive budget
 LIMITS = {
-    "pro": 100,
-    "flash": 500
+    "pro": 200,
+    "flash": 800
 }
 
 def parse_timeout_env(name: str, default: float, allow_none: bool = False) -> float | None:
