@@ -29,6 +29,8 @@ services:
     volumes:
       # Mount only the agent workspace to prevent reading host repo secrets.
       - ./agent:/app/agent:rw
+      # Mount the submodule git data so git commands work inside the container
+      - ./.git/modules/agent:/app/.git/modules/agent:rw
       # Mount the dedicated deploy key securely
       - ./agent_deploy_key:/app/secrets/deploy_key:ro
     working_dir: /app/agent
