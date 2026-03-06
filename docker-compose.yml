@@ -2,24 +2,22 @@ services:
   moderator:
     build: ./moderator
     container_name: ai_moderator
+    network_mode: host
     environment:
       # The REAL API key stays here, safe in the moderator
       API_ENDPOINT: ${API_ENDPOINT}
       API_KEY: ${API_KEY}
       AGENT_TOKEN: ${AGENT_TOKEN}
-    expose:
-      - "8000"
-    networks:
-      - sandbox_net
 
   agent:
     build: ./agent
     container_name: ai_agent
     depends_on:
       - moderator
+    network_mode: host
     environment:
-      # The agent is tricked into thinking the moderator is the Gemini API
-      GEMINI_API_BASE_URL: http://moderator:8000
+      # With host networking, both services communicate over loopback.
+      GEMINI_API_BASE_URL: http://127.0.0.1:8000
       GEMINI_API_KEY: ${AGENT_TOKEN}
       AGENT_ROOT: /app/agent
     volumes:
@@ -39,9 +37,3 @@ services:
     mem_limit: 4g
     cap_drop:
       - ALL # Strips high-level Linux privileges
-    networks:
-      - sandbox_net
-
-networks:
-  sandbox_net:
-    driver: bridge

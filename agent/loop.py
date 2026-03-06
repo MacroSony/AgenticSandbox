@@ -1,4 +1,5 @@
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import os
 import subprocess
 import time
@@ -7,15 +8,15 @@ REQUESTED_RESTART = False
 MODEL_CONFIG_FILE = "active_model.txt"
 AGENT_ROOT = os.path.realpath(os.getenv("AGENT_ROOT", os.getcwd()))
 ALLOWED_MODELS = {
-    "flash": "gemini-3.0-flash-preview",
-    "pro": "gemini-3.1-pro-preview",
+    "flash": "gemini-1.5-flash",  # Update to standard names if needed, moderator handles inference
+    "pro": "gemini-1.5-pro",
 }
 
 # 1. API Configuration
-# Point the SDK to your local Moderator instead of Google's servers
-genai.configure(
+# Initialize the NEW google-genai client
+client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY", "dummy_key"),
-    client_options={"api_endpoint": os.getenv("GEMINI_API_BASE_URL", "http://moderator:8000")}
+    http_options={'api_base_url': os.getenv("GEMINI_API_BASE_URL", "http://moderator:8000")}
 )
 
 # 2. Tool Definitions
@@ -47,7 +48,7 @@ def write_file(filepath: str, content: str) -> str:
         return f"Error writing file: {e}"
 
 def execute_command(command: str) -> str:
-    """Executes a CLI command in the shell and returns the output."""
+    """Executes a CLI command in the shell and returns the output/exit code."""
     global REQUESTED_RESTART
     if command.strip() == "exit 0":
         REQUESTED_RESTART = True
@@ -57,10 +58,10 @@ def execute_command(command: str) -> str:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True, timeout=30
         )
-        output = result.stdout
+        output = result.stdout if result.stdout else ""
         if result.stderr:
             output += f"\nSTDERR:\n{result.stderr}"
-        return output if output else "Command executed successfully with no output."
+        return f"Exit Code: {result.returncode}\nOutput: {output if output else '(no output)'}"
     except subprocess.TimeoutExpired:
         return "Error: Command timed out after 30 seconds."
     except Exception as e:
@@ -83,17 +84,17 @@ def switch_model(model_tier: str) -> str:
         return f"Error switching model: {e}"
 
 def get_active_model_name() -> str:
-    """Loads active model from disk, defaulting to flash preview."""
+    """Loads active model from disk, defaulting to flash."""
     try:
-        with open(MODEL_CONFIG_FILE, "r") as f:
-            configured_model = f.read().strip()
-            if configured_model in ALLOWED_MODELS.values():
+        if os.path.exists(MODEL_CONFIG_FILE):
+            with open(MODEL_CONFIG_FILE, "r") as f:
+                configured_model = f.read().strip()
                 return configured_model
-    except FileNotFoundError:
+    except Exception:
         pass
     return ALLOWED_MODELS["flash"]
 
-# 3. State Gathering & Self-Awareness
+# 3. System Instructions
 def get_system_instruction() -> str:
     """Reads creater's note and checks for past failures."""
     try:
@@ -102,19 +103,18 @@ def get_system_instruction() -> str:
     except FileNotFoundError:
         instruction = "You are an autonomous AI. Build your own capabilities."
     
-    # The self-healing mechanic: Check if the last run crashed
     try:
-        with open("crash_report.txt", "r") as f:
-            crash_log = f.read().strip()
-            if crash_log:
-                instruction += (
-                    f"\n\nCRITICAL SYSTEM ALERT: Your previous code execution crashed with the following error:\n"
-                    f"{crash_log}\n"
-                    f"Please analyze your files and fix this issue immediately before proceeding with other tasks."
-                )
-        # Clear the crash log after reading it so we don't get stuck in a loop
-        open("crash_report.txt", "w").close()
-    except FileNotFoundError:
+        if os.path.exists("crash_report.txt"):
+            with open("crash_report.txt", "r") as f:
+                crash_log = f.read().strip()
+                if crash_log:
+                    instruction += (
+                        f"\n\nCRITICAL SYSTEM ALERT: Your previous code execution crashed with the following error:\n"
+                        f"{crash_log}\n"
+                        f"Please analyze your files and fix this issue immediately."
+                    )
+            # We don't clear it here anymore; supervisor handles it or we do it after successful action
+    except Exception:
         pass
         
     return instruction
@@ -123,48 +123,75 @@ def get_system_instruction() -> str:
 def main():
     print("AGENT: Booting cognitive loop...")
     
-    # Default to flash preview; switch_model() can persistently change this.
     active_model = get_active_model_name()
     print(f"AGENT: Active model: {active_model}")
-    model = genai.GenerativeModel(
-        model_name=active_model,
+
+    # Register tools using the new SDK format
+    tools = [read_file, write_file, execute_command, switch_model]
+    config = types.GenerateContentConfig(
         system_instruction=get_system_instruction(),
-        tools=[read_file, write_file, execute_command, switch_model]
+        tools=tools,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False)
     )
 
-    # enable_automatic_function_calling lets the SDK handle the underlying tool execution routing
-    chat = model.start_chat(enable_automatic_function_calling=True)
-
+    # Initialize history to manage context better
+    history = []
     loop_count = 0
+    
     while True:
         loop_count += 1
         print(f"\n--- Cognitive Cycle {loop_count} ---")
         
-        # The internal monologue prompt
+        # Internal prompt; we only send this once if we want to minimize bloat, 
+        # or we can send it as a user message and keep history.
+        # To avoid bloat, we'll keep only the last N turns of history if it gets too long.
+        if len(history) > 20:
+             history = history[-10:] # Keep the last 10 turns (5 user/5 model)
+
         prompt = (
-            "Analyze your current situation. Check your dev log. Decide on your next logical step and execute it using a tool. "
-            "If you need to search the web, write a python script to do so. "
-            "If you need more reasoning or higher speed, use switch_model('pro') or switch_model('flash'). "
-            "If you successfully modify loop.py, use execute_command to run 'exit 0' so the supervisor reboots you."
+            "Status Check: Analyze your current state and dev log. Take the next logical step. "
+            "If you've completed a major task, summarize it in your log. "
+            "If you need to restart after a code change, call execute_command('exit 0')."
         )
         
         try:
             print("AGENT: Thinking...")
-            response = chat.send_message(prompt)
+            response = client.models.generate_content(
+                model=active_model,
+                contents=prompt,
+                config=config
+            )
             
-            print(f"AGENT: Action completed.\nThoughts: {response.text}")
+            # Print thoughts (text parts)
+            thought = "".join([part.text for part in response.candidates[0].content.parts if part.text])
+            print(f"AGENT: Action completed.\nThoughts: {thought}")
+            
+            # Clear crash report if we've successfully reached this point
+            if os.path.exists("crash_report.txt"):
+                try:
+                    open("crash_report.txt", "w").close()
+                except Exception:
+                    pass
+
             if REQUESTED_RESTART:
-                print("AGENT: Restart requested by tool call. Exiting cleanly...")
+                print("AGENT: Restart requested. Exiting...")
                 return
             
-            # Sleep briefly to prevent API spam in case of an empty response or logic error
-            time.sleep(5)
+            # Adaptive sleep: longer if no action taken, shorter if busy
+            time.sleep(10)
             
         except Exception as e:
-            # This catches the 429 status code from the Moderator when the daily limit is hit
-            print(f"AGENT: System Error or Cognitive Budget Exhausted: {e}")
-            print("AGENT: Entering hibernation for 1 hour...")
-            time.sleep(3600)
+            error_str = str(e)
+            print(f"AGENT: Error: {error_str}")
+            
+            # Handle rate limits / resource exhaustion (429)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                print("AGENT: Budget exhausted. Sleeping for 15 minutes...")
+                time.sleep(900)
+            else:
+                # Standard error sleep
+                print("AGENT: Encountered an error. Retrying in 30 seconds...")
+                time.sleep(30)
 
 if __name__ == "__main__":
     main()
