@@ -22,6 +22,7 @@ services:
       GEMINI_API_BASE_URL: http://moderator:8000
       GEMINI_API_KEY: ${AGENT_TOKEN}
       AGENT_ROOT: /app/agent
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL}
       # Force Git to use our isolated deploy key and ignore host key prompts
       GIT_SSH_COMMAND: "ssh -i /app/secrets/deploy_key -o StrictHostKeyChecking=no"
       GIT_AUTHOR_NAME: ${GIT_USER_NAME:-agent}
